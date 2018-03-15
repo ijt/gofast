@@ -408,6 +408,102 @@ func NewResponsePipe() (p *ResponsePipe) {
 	return
 }
 
+func readHeader(linebody *bufio.Reader) (statusCode int, header http.Header, err error) {
+
+	header = make(http.Header)
+	headerLines, sawBlankLine := 0, false
+	for {
+		var line []byte
+		var isPrefix bool
+		line, isPrefix, err = linebody.ReadLine()
+		if isPrefix {
+			statusCode = http.StatusBadGateway
+			err = fmt.Errorf("gofast: long header line from subprocess")
+			return
+		}
+		if err != nil {
+			break
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			statusCode = http.StatusBadGateway
+			err = fmt.Errorf("gofast: error reading headers: %v", err)
+			return
+		}
+		if len(line) == 0 {
+			sawBlankLine = true
+			break
+		}
+		headerLines++
+		parts := strings.SplitN(string(line), ":", 2)
+		if len(parts) < 2 {
+			err = fmt.Errorf("gofast: bogus header line: %s", string(line))
+			return
+		}
+
+		key, val := parts[0], parts[1]
+		key, val = strings.TrimSpace(key), strings.TrimSpace(val)
+		switch key {
+		case "Status":
+			if len(val) < 3 {
+				err = fmt.Errorf("gofast: bogus status (short): %q", val)
+				return
+			}
+			var code int
+			code, err = strconv.Atoi(val[0:3])
+			if err != nil {
+				err = fmt.Errorf("gofast: bogus status: %q\nline was %q",
+					val, line)
+				return
+			}
+			statusCode = code
+		default:
+			header.Add(key, val)
+		}
+	}
+	if headerLines == 0 || !sawBlankLine {
+		statusCode = http.StatusBadGateway
+		err = fmt.Errorf("gofast: no headers")
+		return
+	}
+	return
+}
+
+func writeHeader(w http.ResponseWriter, statusCode int, header http.Header) (err error) {
+
+	// validate header
+	if header.Get("Content-Type") == "" {
+		statusCode = http.StatusBadGateway
+		err = fmt.Errorf("gofast: missing required Content-Type in headers")
+		return
+	}
+
+	// infer status code, if not given one
+	if statusCode == 0 {
+		// try to resolve statusCode from header hints
+		if loc := header.Get("Location"); loc != "" {
+			statusCode = http.StatusFound
+		} else {
+			statusCode = http.StatusOK
+		}
+	}
+
+	// Copy headers to rw's headers, after we've decided not to
+	// go into handleInternalRedirect, which won't want its rw
+	// headers to have been touched.
+	for k, vv := range header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+
+	// start writing response
+	w.WriteHeader(statusCode)
+	return
+}
+
 // ResponsePipe contains readers and writers that handles
 // all FastCGI output streams
 type ResponsePipe struct {
@@ -459,99 +555,17 @@ func (pipes *ResponsePipe) writeError(w io.Writer) (err error) {
 
 // writeTo writes the given output into http.ResponseWriter
 func (pipes *ResponsePipe) writeResponse(w http.ResponseWriter) (err error) {
+
 	linebody := bufio.NewReaderSize(pipes.stdOutReader, 1024)
-	headers := make(http.Header)
-	statusCode := 0
-	headerLines := 0
-	sawBlankLine := false
-
-	for {
-		var line []byte
-		var isPrefix bool
-		line, isPrefix, err = linebody.ReadLine()
-		if isPrefix {
-			w.WriteHeader(http.StatusInternalServerError)
-			err = fmt.Errorf("gofast: long header line from subprocess")
-			return
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			err = fmt.Errorf("gofast: error reading headers: %v", err)
-			return
-		}
-		if len(line) == 0 {
-			sawBlankLine = true
-			break
-		}
-		headerLines++
-		parts := strings.SplitN(string(line), ":", 2)
-		if len(parts) < 2 {
-			err = fmt.Errorf("gofast: bogus header line: %s", string(line))
-			return
-		}
-		header, val := parts[0], parts[1]
-		header = strings.TrimSpace(header)
-		val = strings.TrimSpace(val)
-		switch {
-		case header == "Status":
-			if len(val) < 3 {
-				err = fmt.Errorf("gofast: bogus status (short): %q", val)
-				return
-			}
-			var code int
-			code, err = strconv.Atoi(val[0:3])
-			if err != nil {
-				err = fmt.Errorf("gofast: bogus status: %q\nline was %q",
-					val, line)
-				return
-			}
-			statusCode = code
-		default:
-			headers.Add(header, val)
-		}
-	}
-	if headerLines == 0 || !sawBlankLine {
-		w.WriteHeader(http.StatusInternalServerError)
-		err = fmt.Errorf("gofast: no headers")
+	statusCode, header, err := readHeader(linebody)
+	if err != nil {
 		return
 	}
 
-	if loc := headers.Get("Location"); loc != "" {
-		/*
-			if strings.HasPrefix(loc, "/") && h.PathLocationHandler != nil {
-				h.handleInternalRedirect(rw, req, loc)
-				return
-			}
-		*/
-		if statusCode == 0 {
-			statusCode = http.StatusFound
-		}
-	}
+	// write header to writer
+	writeHeader(w, statusCode, header)
 
-	if statusCode == 0 && headers.Get("Content-Type") == "" {
-		w.WriteHeader(http.StatusInternalServerError)
-		err = fmt.Errorf("gofast: missing required Content-Type in headers")
-		return
-	}
-
-	if statusCode == 0 {
-		statusCode = http.StatusOK
-	}
-
-	// Copy headers to rw's headers, after we've decided not to
-	// go into handleInternalRedirect, which won't want its rw
-	// headers to have been touched.
-	for k, vv := range headers {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-
-	w.WriteHeader(statusCode)
-
+	// write body to writer
 	_, err = io.Copy(w, linebody)
 	if err != nil {
 		err = fmt.Errorf("gofast: copy error: %v", err)
